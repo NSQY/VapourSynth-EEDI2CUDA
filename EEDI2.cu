@@ -422,6 +422,7 @@ public:
   }
 
   const VSVideoInfo &getOutputVI() const { return passes.back()->getOutputVI(); }
+  const VSFilterDependency getFilterDependency() const { return {node.get(), rpStrictSpatial}; }
 
   VSFrame *getFrame(int n, int activationReason, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
     if (activationReason == arInitial) {
@@ -1598,8 +1599,11 @@ template <typename T> void eedi2CreateInner(std::string_view filterName, const V
     if (err)
       num_streams = 1;
     auto data = new (num_streams) Instance<T>(filterName, in, vsapi);
-    vsapi->createVideoFilter(out, filterName.data(), &data->firstReactor().getOutputVI(), eedi2GetFrame<T>, eedi2Free<T>,
-                             num_streams > 1 ? fmParallel : fmParallelRequests, nullptr, 0, data, core);
+
+    auto &fr = data->firstReactor();
+    VSFilterDependency deps[] = {fr.getFilterDependency()};
+    vsapi->createVideoFilter(out, filterName.data(), &fr.getOutputVI(), eedi2GetFrame<T>, eedi2Free<T>,
+                             num_streams > 1 ? fmParallel : fmParallelRequests, deps, 1, data, core);
   } catch (const std::exception &exc) {
     vsapi->mapSetError(out, ("EEDI2CUDA: "s + exc.what()).c_str());
     return;
