@@ -1621,6 +1621,7 @@ void VS_CC BuildConfigCreate(const VSMap *, VSMap *out, void *, VSCore *, const 
   vsapi->mapSetData(out, "version", VERSION, -1, ptData, maAppend);
   vsapi->mapSetData(out, "options", BUILD_OPTIONS, -1, ptData, maAppend);
   vsapi->mapSetData(out, "timestamp", CONFIGURE_TIME, -1, ptData, maAppend);
+  vsapi->mapSetInt(out, "vsapi_version", VAPOURSYNTH_API_VERSION, maAppend);
 }
 
 #define eedi2_common_params                                                                                                                \
