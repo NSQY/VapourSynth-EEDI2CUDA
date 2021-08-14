@@ -20,6 +20,8 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -51,28 +53,6 @@ class CUDAError : public std::runtime_error {
 template <typename Td, typename Ts> void numeric_cast_to(Td &dst, Ts src) { dst = boost::numeric_cast<Td>(src); }
 template <typename Td, typename Ts> void narrow_cast_to(Td &dst, Ts src) { dst = static_cast<Td>(src); }
 
-template <typename T> struct Pass {
-  virtual ~Pass() = default;
-  virtual T *getSrcDevPtr() { throw std::logic_error("not implemented"); }
-  virtual unsigned getSrcPitch() { throw std::logic_error("not implemented"); }
-  virtual const T *getDstDevPtr() const { throw std::logic_error("not implemented"); }
-  virtual unsigned getDstPitch() { throw std::logic_error("not implemented"); }
-  virtual void process(int n, int plane, cudaStream_t stream) = 0;
-  [[nodiscard]] virtual Pass *dup() const = 0;
-
-  virtual void setSrcDevPtr(T *) { throw std::logic_error("this variable is readonly"); }
-  virtual void setSrcPitch(unsigned) { throw std::logic_error("this variable is readonly"); }
-  virtual void setDstDevPtr(T *) { throw std::logic_error("this variable is readonly"); };
-  virtual void setDstPitch(unsigned) { throw std::logic_error("this variable is readonly"); }
-
-  const VSVideoInfo &getOutputVI() const { return vi2; };
-
-  Pass(const VSVideoInfo &vi, const VSVideoInfo &vi2) : vi(vi), vi2(vi2) {}
-
-protected:
-  VSVideoInfo vi, vi2;
-};
-
 struct EEDI2Param {
   unsigned d_pitch;
   unsigned nt4, nt7, nt8, nt13, nt19;
@@ -83,527 +63,11 @@ struct EEDI2Param {
   int width, height;
 };
 
-template <typename T> class EEDI2Pass final : public Pass<T> {
-  EEDI2Param d;
-
-  T *dst, *msk, *src, *tmp;
-  T *dst2, *dst2M, *tmp2, *tmp2_2, *tmp2_3, *msk2;
-
-  unsigned map, pp, fieldS;
-  unsigned d_pitch;
-
-public:
-  EEDI2Pass(const EEDI2Pass &other) : Pass<T>(other), d(other.d), map(other.map), pp(other.pp), fieldS(other.fieldS) { initCuda(); }
-
-  EEDI2Pass(const VSVideoInfo &vi, const VSVideoInfo &vi2, EEDI2Param d, unsigned map, unsigned pp, unsigned fieldS)
-      : Pass<T>(vi, vi2), d(d), map(map), pp(pp), fieldS(fieldS) {
-    initCuda();
-  }
-
-  [[nodiscard]] Pass<T> *dup() const override { return new EEDI2Pass(*this); }
-
-  ~EEDI2Pass() override {
-    try_cuda(cudaFree(dst));
-    try_cuda(cudaFree(dst2));
-  }
-
-private:
-  void initCuda() {
-    constexpr size_t numMem = 4;
-    constexpr size_t numMem2x = 6;
-    T **mem = &dst;
-    size_t pitch;
-    auto width = vi.width;
-    auto height = vi.height;
-    auto height2x = height * 2;
-    try_cuda(cudaMallocPitch(&mem[0], &pitch, width * sizeof(T), height * numMem));
-    narrow_cast_to(d_pitch, pitch);
-    for (size_t i = 1; i < numMem; ++i)
-      mem[i] = reinterpret_cast<T *>(reinterpret_cast<char *>(mem[i - 1]) + d_pitch * height);
-
-    if (map == 0 || map == 3) {
-      try_cuda(cudaMalloc(&dst2, d_pitch * height * numMem2x * 2));
-      mem = &dst2;
-      for (size_t i = 1; i < numMem2x; ++i)
-        mem[i] = reinterpret_cast<T *>(reinterpret_cast<char *>(mem[i - 1]) + d_pitch * height2x);
-    } else {
-      dst2 = nullptr;
-    }
-  }
-
-public:
-  T *getSrcDevPtr() override { return src; }
-  unsigned getSrcPitch() override { return d_pitch; }
-  const T *getDstDevPtr() const override {
-    switch (map) {
-    case 0:
-      return dst2;
-    case 1:
-      return msk;
-    case 3:
-      return tmp2;
-    default:
-      return dst;
-    }
-  }
-  unsigned getDstPitch() override { return d_pitch; }
-
-  void process(int n, int plane, cudaStream_t stream) override {
-    auto field = fieldS;
-    if (field > 1)
-      field = (n & 1) ? (field == 2 ? 1 : 0) : (field == 2 ? 0 : 1);
-
-    auto subSampling = plane ? vi.format->subSamplingW : 0u;
-
-    auto width = vi.width >> subSampling;
-    auto height = vi.height >> subSampling;
-    auto height2x = height * 2;
-    auto width_bytes = width * sizeof(T);
-    auto d_pitch = this->d_pitch >> subSampling;
-
-    d.field = field;
-    d.width = width;
-    d.height = height;
-    d.subSampling = subSampling;
-    d.d_pitch = d_pitch;
-
-    dim3 blocks = dim3(64, 1);
-    dim3 grids = dim3((width - 1) / blocks.x + 1, (height - 1) / blocks.y + 1);
-
-    buildEdgeMask<<<grids, blocks, 0, stream>>>(d, src, msk);
-    erode<<<grids, blocks, 0, stream>>>(d, msk, tmp);
-    dilate<<<grids, blocks, 0, stream>>>(d, tmp, msk);
-    erode<<<grids, blocks, 0, stream>>>(d, msk, tmp);
-    removeSmallHorzGaps<<<grids, blocks, 0, stream>>>(d, tmp, msk);
-
-    if (map != 1) {
-      calcDirections<<<grids, blocks, 0, stream>>>(d, src, msk, tmp);
-      filterDirMap<<<grids, blocks, 0, stream>>>(d, msk, tmp, dst);
-      expandDirMap<<<grids, blocks, 0, stream>>>(d, msk, dst, tmp);
-      filterMap<<<grids, blocks, 0, stream>>>(d, msk, tmp, dst);
-
-      if (map != 2) {
-        auto upscaleBy2 = [&](const T *src, T *dst) {
-          try_cuda(cudaMemcpy2DAsync(dst + d_pitch * (1 - field), d_pitch * 2, src, d_pitch, width_bytes, height, cudaMemcpyDeviceToDevice,
-                                     stream));
-        };
-        try_cuda(cudaMemset2DAsync(dst2, d_pitch, 0, width_bytes, height2x, stream));
-        try_cuda(cudaMemset2DAsync(tmp2, d_pitch, 255, width_bytes, height2x, stream));
-        upscaleBy2(src, dst2);
-        upscaleBy2(dst, tmp2_2);
-        upscaleBy2(msk, msk2);
-
-        markDirections2X<<<grids, blocks, 0, stream>>>(d, msk2, tmp2_2, tmp2);
-        filterDirMap2X<<<grids, blocks, 0, stream>>>(d, msk2, tmp2, dst2M);
-        expandDirMap2X<<<grids, blocks, 0, stream>>>(d, msk2, dst2M, tmp2);
-        fillGaps2X<<<grids, blocks, 0, stream>>>(d, msk2, tmp2, tmp2_3);
-        fillGaps2XStep2<<<grids, blocks, 0, stream>>>(d, msk2, tmp2, tmp2_3, dst2M);
-        fillGaps2X<<<grids, blocks, 0, stream>>>(d, msk2, dst2M, tmp2_3);
-        fillGaps2XStep2<<<grids, blocks, 0, stream>>>(d, msk2, dst2M, tmp2_3, tmp2);
-
-        if (map != 3) {
-          if (field)
-            try_cuda(cudaMemcpyAsync(dst2 + d_pitch / sizeof(T) * (height2x - 1), dst2 + d_pitch / sizeof(T) * (height2x - 2), width_bytes,
-                                     cudaMemcpyDeviceToDevice, stream));
-          else
-            try_cuda(cudaMemcpyAsync(dst2, dst2 + d_pitch / sizeof(T), width_bytes, cudaMemcpyDeviceToDevice, stream));
-          try_cuda(cudaMemcpy2DAsync(tmp2_3, d_pitch, tmp2, d_pitch, width_bytes, height2x, cudaMemcpyDeviceToDevice, stream));
-
-          interpolateLattice<<<grids, blocks, 0, stream>>>(d, tmp2_2, tmp2, dst2, tmp2_3);
-
-          if (pp == 1) {
-            filterDirMap2X<<<grids, blocks, 0, stream>>>(d, msk2, tmp2_3, dst2M);
-            expandDirMap2X<<<grids, blocks, 0, stream>>>(d, msk2, dst2M, tmp2);
-            postProcess<<<grids, blocks, 0, stream>>>(d, tmp2, tmp2_3, dst2);
-          } else if (pp != 0) {
-            throw std::runtime_error("currently only pp == 1 is supported");
-          }
-        }
-      }
-    }
-  }
-};
-
-template <typename T> struct BridgePass : public Pass<T> {
-  using Pass<T>::Pass;
-
-  BridgePass(const BridgePass &other) : Pass<T>(other) {}
-
-protected:
-  T *src = nullptr, *dst = nullptr;
-  unsigned d_pitch_src, d_pitch_dst;
-
-public:
-  void setSrcDevPtr(T *p) final { src = p; }
-  void setSrcPitch(unsigned p) final { d_pitch_src = p; }
-  void setDstDevPtr(T *p) final { dst = p; }
-  void setDstPitch(unsigned p) final { d_pitch_dst = p; }
-  T *getSrcDevPtr() final { return src; }
-  unsigned getSrcPitch() final { return d_pitch_src; }
-  const T *getDstDevPtr() const final { return dst; }
-  unsigned getDstPitch() final { return d_pitch_dst; }
-};
-
-template <typename T> struct TransposePass final : public BridgePass<T> {
-  using BridgePass<T>::BridgePass;
-
-  [[nodiscard]] Pass<T> *dup() const override { return new TransposePass(*this); }
-
-  void process(int, int plane, cudaStream_t stream) override {
-    auto sw = !!plane * vi.format->subSamplingW;
-    auto sh = !!plane * vi.format->subSamplingH;
-    auto width = vi.width >> sw;
-    auto height = vi.height >> sh;
-    dim3 blocks = dim3(64, 8);
-    dim3 grids = dim3((width - 1) / blocks.x + 1, (height - 1) / blocks.x + 1);
-    transpose<<<grids, blocks, 0, stream>>>(src, dst, width, height, d_pitch_src / sizeof(T) >> sw, d_pitch_dst / sizeof(T) >> sh);
-  }
-};
-
 __constant__ float spline36_offset00_weights12[] = {9.8684211e-03f,  0.0000000e+00f, -5.9210526e-02f, 0.0000000e+00f,
                                                     2.9934211e-01f,  5.0000000e-01f, 2.9934211e-01f,  0.0000000e+00f,
                                                     -5.9210526e-02f, 0.0000000e+00f, 9.8684211e-03f,  -6.9388939e-18f};
 
 __constant__ float spline36_offset05_weights6[] = {0.019736842f, -0.118421053f, 0.598684211f, 0.598684211f, -0.118421053f, 0.019736842f};
-
-template <typename T> struct ScaleDownWPass final : public BridgePass<T> {
-  using BridgePass<T>::BridgePass;
-
-  [[nodiscard]] Pass<T> *dup() const override { return new ScaleDownWPass(*this); }
-
-  void process(int, int plane, cudaStream_t stream) override {
-    auto sw = !!plane * vi.format->subSamplingW;
-    auto sh = !!plane * vi.format->subSamplingH;
-    auto width = vi2.width >> sw;
-    auto height = vi2.height >> sh;
-    dim3 blocks = dim3(64, 8);
-    dim3 grids = dim3((width - 1) / blocks.x + 1, (height - 1) / blocks.y + 1);
-    resample12<<<grids, blocks, 0, stream>>>(src, dst, width, height, d_pitch_src >> sw, d_pitch_dst >> sw);
-  }
-};
-
-template <typename T> struct ShiftWPass final : public BridgePass<T> {
-  using BridgePass<T>::BridgePass;
-
-  [[nodiscard]] Pass<T> *dup() const override { return new ShiftWPass(*this); }
-
-  void process(int, int plane, cudaStream_t stream) override {
-    auto sw = !!plane * vi.format->subSamplingW;
-    auto sh = !!plane * vi.format->subSamplingH;
-    auto width = vi.width >> sw;
-    auto height = vi.height >> sh;
-    dim3 blocks = dim3(64, 8);
-    dim3 grids = dim3((width - 1) / blocks.x + 1, (height - 1) / blocks.y + 1);
-    resample6<<<grids, blocks, 0, stream>>>(src, dst, width, height, d_pitch_src >> sw, d_pitch_dst >> sw);
-  }
-};
-
-template <typename T> class Pipeline {
-  std::vector<std::unique_ptr<Pass<T>>> passes;
-  std::unique_ptr<VSNodeRef, void (*const)(VSNodeRef *)> node;
-  VSVideoInfo vi;
-  int device_id;
-  cudaStream_t stream;
-  T *h_src, *h_dst;
-  std::vector<T *> fbs;
-
-public:
-  Pipeline(std::string_view filterName, const VSMap *in, const VSAPI *vsapi)
-      : node(vsapi->propGetNode(in, "clip", 0, nullptr), vsapi->freeNode) {
-    using invalid_arg = std::invalid_argument;
-
-    vi = *vsapi->getVideoInfo(node.get());
-    auto vi2 = vi;
-    EEDI2Param d;
-    const auto &fmt = *vi.format;
-    unsigned map, pp, fieldS;
-
-    if (!isConstantFormat(&vi) || fmt.sampleType != stInteger || fmt.bytesPerSample > 2)
-      throw invalid_arg("only constant format 8-16 bits integer input supported");
-    if (vi.width < 8 || vi.height < 7)
-      throw invalid_arg("clip resolution too low");
-
-    auto propGetIntDefault = [&](const char *key, int64_t def) {
-      int err;
-      auto ret = vsapi->propGetInt(in, key, 0, &err);
-      return err ? def : ret;
-    };
-
-    if (filterName == "EEDI2")
-      numeric_cast_to(fieldS, vsapi->propGetInt(in, "field", 0, nullptr));
-    else
-      fieldS = 1;
-
-    numeric_cast_to(d.mthresh, propGetIntDefault("mthresh", 10));
-    numeric_cast_to(d.lthresh, propGetIntDefault("lthresh", 20));
-    numeric_cast_to(d.vthresh, propGetIntDefault("vthresh", 20));
-
-    numeric_cast_to(d.estr, propGetIntDefault("estr", 2));
-    numeric_cast_to(d.dstr, propGetIntDefault("dstr", 4));
-    numeric_cast_to(d.maxd, propGetIntDefault("maxd", 24));
-
-    numeric_cast_to(map, propGetIntDefault("map", 0));
-    numeric_cast_to(pp, propGetIntDefault("pp", 1));
-
-    unsigned nt;
-    numeric_cast_to(nt, propGetIntDefault("nt", 50));
-
-    numeric_cast_to(device_id, propGetIntDefault("device_id", -1));
-
-    if (fieldS > 3)
-      throw invalid_arg("field must be 0, 1, 2 or 3");
-    if (d.maxd < 1 || d.maxd > 29)
-      throw invalid_arg("maxd must be between 1 and 29 (inclusive)");
-    if (map > 3)
-      throw invalid_arg("map must be 0, 1, 2 or 3");
-    if (pp > 3)
-      throw invalid_arg("pp must be 0, 1, 2 or 3");
-
-    if (map == 0 || map == 3)
-      vi2.height *= 2;
-
-    d.mthresh *= d.mthresh;
-    d.vthresh *= 81;
-
-    nt <<= sizeof(T) * 8 - 8;
-    d.nt4 = nt * 4;
-    d.nt7 = nt * 7;
-    d.nt8 = nt * 8;
-    d.nt13 = nt * 13;
-    d.nt19 = nt * 19;
-
-    passes.emplace_back(new EEDI2Pass<T>(vi, vi2, d, map, pp, fieldS));
-
-    if (filterName != "EEDI2") {
-      auto vi3 = vi2;
-      std::swap(vi3.width, vi3.height); // XXX: this is correct for 420 & 444 only
-      passes.emplace_back(new TransposePass<T>(vi2, vi3));
-      auto vi4 = vi3;
-      if (filterName == "AA2") {
-        vi4.width /= 2;
-        passes.emplace_back(new ScaleDownWPass<T>(vi3, vi4));
-      } else {
-        passes.emplace_back(new ShiftWPass<T>(vi3, vi4));
-      }
-      auto vi5 = vi4;
-      vi5.height *= 2;
-      passes.emplace_back(new EEDI2Pass<T>(vi4, vi5, d, map, pp, fieldS));
-      auto vi6 = vi5;
-      std::swap(vi6.width, vi6.height);
-      passes.emplace_back(new TransposePass<T>(vi5, vi6));
-      auto vi7 = vi6;
-      if (filterName == "AA2") {
-        vi7.width /= 2;
-        passes.emplace_back(new ScaleDownWPass<T>(vi6, vi7));
-      } else {
-        passes.emplace_back(new ShiftWPass<T>(vi6, vi7));
-      }
-    }
-
-    passes.shrink_to_fit();
-
-    initCuda();
-  }
-
-  Pipeline(const Pipeline &other, const VSAPI *vsapi)
-      : node(vsapi->cloneNodeRef(other.node.get()), vsapi->freeNode), vi(other.vi), device_id(other.device_id) {
-    passes.reserve(other.passes.size());
-    for (const auto &step : other.passes)
-      passes.emplace_back(step->dup());
-
-    initCuda();
-  }
-
-  ~Pipeline() {
-    try_cuda(cudaFreeHost(h_src));
-    try_cuda(cudaFreeHost(h_dst));
-    for (auto fb : fbs)
-      try_cuda(cudaFree(fb));
-  }
-
-  const VSVideoInfo &getOutputVI() const { return passes.back()->getOutputVI(); }
-
-  VSFrameRef *getFrame(int n, int activationReason, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
-    if (activationReason == arInitial) {
-      vsapi->requestFrameFilter(n, node.get(), frameCtx);
-      return nullptr;
-    } else if (activationReason != arAllFramesReady)
-      return nullptr;
-
-    if (device_id != -1)
-      try_cuda(cudaSetDevice(device_id));
-
-    auto vi2 = passes.back()->getOutputVI();
-
-    std::unique_ptr<const VSFrameRef, void (*const)(const VSFrameRef *)> src_frame{vsapi->getFrameFilter(n, node.get(), frameCtx),
-                                                                                   vsapi->freeFrame};
-    std::unique_ptr<VSFrameRef, void (*const)(const VSFrameRef *)> dst_frame{
-        vsapi->newVideoFrame(vi2.format, vi2.width, vi2.height, src_frame.get(), core), vsapi->freeFrame};
-
-    for (int plane = 0; plane < vi.format->numPlanes; ++plane) {
-      auto src_width = vsapi->getFrameWidth(src_frame.get(), plane);
-      auto src_height = vsapi->getFrameHeight(src_frame.get(), plane);
-      auto dst_width = vsapi->getFrameWidth(dst_frame.get(), plane);
-      auto dst_height = vsapi->getFrameHeight(dst_frame.get(), plane);
-      auto s_pitch_src = vsapi->getStride(src_frame.get(), plane);
-      auto s_pitch_dst = vsapi->getStride(dst_frame.get(), plane);
-      auto src_width_bytes = src_width * sizeof(T);
-      auto dst_width_bytes = dst_width * sizeof(T);
-      auto s_src = vsapi->getReadPtr(src_frame.get(), plane);
-      auto s_dst = vsapi->getWritePtr(dst_frame.get(), plane);
-      auto d_src = passes.front()->getSrcDevPtr();
-      auto d_dst = passes.back()->getDstDevPtr();
-      auto d_pitch_src = passes.front()->getSrcPitch() >> !!plane * vi.format->subSamplingW;
-      auto d_pitch_dst = passes.back()->getDstPitch() >> !!plane * vi2.format->subSamplingW;
-
-      // upload
-      vs_bitblt(h_src, d_pitch_src, s_src, s_pitch_src, src_width_bytes, src_height);
-      try_cuda(cudaMemcpy2DAsync(d_src, d_pitch_src, h_src, d_pitch_src, src_width_bytes, src_height, cudaMemcpyHostToDevice, stream));
-
-      // process
-      for (unsigned i = 0; i < passes.size(); ++i) {
-        auto &cur = *passes[i];
-        if (i) {
-          auto &last = *passes[i - 1];
-          auto &next = *passes[i + 1];
-          auto last_vi = last.getOutputVI();
-          auto sw = !!plane * last_vi.format->subSamplingW;
-          auto sh = !!plane * last_vi.format->subSamplingH;
-          if (!cur.getSrcDevPtr()) {
-            cur.setSrcDevPtr(const_cast<T *>(last.getDstDevPtr()));
-            cur.setSrcPitch(last.getDstPitch());
-          }
-          if (!cur.getDstDevPtr()) {
-            cur.setDstDevPtr(next.getSrcDevPtr());
-            cur.setDstPitch(next.getSrcPitch());
-          }
-          if (!cur.getDstDevPtr()) {
-            auto vi = cur.getOutputVI();
-            size_t pitch;
-            T *fb;
-            try_cuda(cudaMallocPitch(&fb, &pitch, vi.width * sizeof(T), vi.height));
-            cur.setDstDevPtr(fb);
-            next.setSrcDevPtr(fb);
-            cur.setDstPitch(static_cast<unsigned>(pitch));
-            next.setSrcPitch(static_cast<unsigned>(pitch));
-            fbs.push_back(fb);
-          }
-          auto curPtr = cur.getSrcDevPtr();
-          auto lastPtr = last.getDstDevPtr();
-          if (curPtr != lastPtr)
-            try_cuda(cudaMemcpy2DAsync(curPtr, cur.getSrcPitch() >> sw, lastPtr, last.getDstPitch() >> sw, last_vi.width * sizeof(T) >> sw,
-                                       last_vi.height >> sh, cudaMemcpyDeviceToDevice, stream));
-        }
-        cur.process(n, plane, stream);
-      }
-
-      // download
-      try_cuda(cudaMemcpy2DAsync(h_dst, d_pitch_dst, d_dst, d_pitch_dst, dst_width_bytes, dst_height, cudaMemcpyDeviceToHost, stream));
-      try_cuda(cudaStreamSynchronize(stream));
-      vs_bitblt(s_dst, s_pitch_dst, h_dst, d_pitch_dst, dst_width_bytes, dst_height);
-    }
-
-    return dst_frame.release();
-  }
-
-private:
-  void initCuda() {
-    try {
-      try_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    } catch (const CUDAError &exc) {
-      throw CUDAError(exc.what() + " Please upgrade your driver."s);
-    }
-
-    if (auto &firstStep = *passes.front(); !firstStep.getSrcDevPtr()) {
-      size_t pitch;
-      T *fb_d_src;
-      try_cuda(cudaMallocPitch(&fb_d_src, &pitch, vi.width * sizeof(T), vi.height));
-      firstStep.setSrcDevPtr(fb_d_src);
-      firstStep.setSrcPitch(static_cast<unsigned>(pitch));
-      fbs.push_back(fb_d_src);
-    }
-
-    if (auto &lastStep = *passes.back(); !lastStep.getDstDevPtr()) {
-      auto vi2 = lastStep.getOutputVI();
-      size_t pitch;
-      T *fb_d_dst;
-      try_cuda(cudaMallocPitch(&fb_d_dst, &pitch, vi2.width * sizeof(T), vi2.height));
-      lastStep.setDstDevPtr(fb_d_dst);
-      lastStep.setDstPitch(static_cast<unsigned>(pitch));
-      fbs.push_back(fb_d_dst);
-    }
-
-    auto d_pitch_src = passes.front()->getSrcPitch();
-    auto d_pitch_dst = passes.back()->getDstPitch();
-    auto src_height = vi.height;
-    auto dst_height = passes.back()->getOutputVI().height;
-    try_cuda(cudaHostAlloc(&h_src, d_pitch_src * src_height, cudaHostAllocWriteCombined));
-    try_cuda(cudaHostAlloc(&h_dst, d_pitch_dst * dst_height, cudaHostAllocDefault));
-  }
-};
-
-template <typename T> class Instance {
-  using Item = std::pair<Pipeline<T>, std::atomic_flag>;
-
-  unsigned num_streams;
-  boost::sync::semaphore semaphore;
-
-  Item *items() { return reinterpret_cast<Item *>(this + 1); }
-
-public:
-  Instance(std::string_view filterName, const VSMap *in, const VSAPI *vsapi) : semaphore(num_streams) {
-    auto items = this->items();
-    new (items) Item(std::piecewise_construct, std::forward_as_tuple(filterName, in, vsapi), std::forward_as_tuple());
-    items[0].second.clear();
-    for (unsigned i = 1; i < num_streams; ++i) {
-      new (items + i) Item(std::piecewise_construct, std::forward_as_tuple(firstReactor(), vsapi), std::forward_as_tuple());
-      items[i].second.clear();
-    }
-  }
-
-  ~Instance() {
-    auto items = this->items();
-    for (unsigned i = 0; i < num_streams; ++i)
-      items[i].~Item();
-  }
-
-  Pipeline<T> &firstReactor() { return items()[0].first; }
-
-  Pipeline<T> &acquireReactor() {
-    if (num_streams == 1)
-      return firstReactor();
-    semaphore.wait();
-    auto items = this->items();
-    for (unsigned i = 0; i < num_streams; ++i) {
-      if (!items[i].second.test_and_set())
-        return items[i].first;
-    }
-    unreachable();
-  }
-
-  void releaseReactor(const Pipeline<T> &instance) {
-    if (num_streams == 1)
-      return;
-    auto items = this->items();
-    for (unsigned i = 0; i < num_streams; ++i) {
-      if (&instance == &items[i].first) {
-        items[i].second.clear();
-        break;
-      }
-    }
-    semaphore.post();
-  }
-
-  static void *operator new(size_t sz, unsigned num_streams) {
-    auto p = static_cast<Instance *>(::operator new(sz + sizeof(Item) * num_streams));
-    p->num_streams = num_streams;
-    return p;
-  }
-
-  static void operator delete(void *p, unsigned) { ::operator delete(p); }
-
-  static void operator delete(void *p) { ::operator delete(p); }
-};
 
 #define KERNEL __global__ __launch_bounds__(64)
 
@@ -613,10 +77,10 @@ public:
   setup_xy;                                                                                                                                \
   int width = d.width, height = d.height;                                                                                                  \
   auto pitch = d.d_pitch;                                                                                                                  \
-  __assume(width > 0);                                                                                                                     \
-  __assume(height > 0);                                                                                                                    \
-  __assume(x >= 0);                                                                                                                        \
-  __assume(y >= 0);                                                                                                                        \
+  __builtin_assume(width > 0);                                                                                                                     \
+  __builtin_assume(height > 0);                                                                                                                    \
+  __builtin_assume(x >= 0);                                                                                                                        \
+  __builtin_assume(y >= 0);                                                                                                                        \
   constexpr T shift = sizeof(T) * 8 - 8, peak = std::numeric_limits<T>::max(), ten = 10 << shift, twleve = 12 << shift,                    \
               eight = 8 << shift, twenty = 20 << shift, three = 3 << shift, nine = 9 << shift;                                             \
   constexpr T shift2 = shift + 2, neutral = peak / 2;                                                                                      \
@@ -1563,6 +1027,544 @@ template <typename T> __global__ void resample6(const T *src, T *dst, int width,
 
   out = value_bound<T>(__float2int_rn(c));
 }
+
+template <typename T> struct Pass {
+  virtual ~Pass() = default;
+  virtual T *getSrcDevPtr() { throw std::logic_error("not implemented"); }
+  virtual unsigned getSrcPitch() { throw std::logic_error("not implemented"); }
+  virtual const T *getDstDevPtr() const { throw std::logic_error("not implemented"); }
+  virtual unsigned getDstPitch() { throw std::logic_error("not implemented"); }
+  virtual void process(int n, int plane, cudaStream_t stream) = 0;
+  [[nodiscard]] virtual Pass *dup() const = 0;
+
+  virtual void setSrcDevPtr(T *) { throw std::logic_error("this variable is readonly"); }
+  virtual void setSrcPitch(unsigned) { throw std::logic_error("this variable is readonly"); }
+  virtual void setDstDevPtr(T *) { throw std::logic_error("this variable is readonly"); };
+  virtual void setDstPitch(unsigned) { throw std::logic_error("this variable is readonly"); }
+
+  const VSVideoInfo &getOutputVI() const { return vi2; };
+
+  Pass(const VSVideoInfo &vi, const VSVideoInfo &vi2) : vi(vi), vi2(vi2) {}
+
+protected:
+  VSVideoInfo vi, vi2;
+};
+
+template <typename T> struct BridgePass : public Pass<T> {
+  using Pass<T>::Pass;
+
+  BridgePass(const BridgePass &other) : Pass<T>(other) {}
+
+protected:
+  T *src = nullptr, *dst = nullptr;
+  unsigned d_pitch_src, d_pitch_dst;
+
+public:
+  void setSrcDevPtr(T *p) final { src = p; }
+  void setSrcPitch(unsigned p) final { d_pitch_src = p; }
+  void setDstDevPtr(T *p) final { dst = p; }
+  void setDstPitch(unsigned p) final { d_pitch_dst = p; }
+  T *getSrcDevPtr() final { return src; }
+  unsigned getSrcPitch() final { return d_pitch_src; }
+  const T *getDstDevPtr() const final { return dst; }
+  unsigned getDstPitch() final { return d_pitch_dst; }
+};
+
+template <typename T> struct TransposePass final : public BridgePass<T> {
+  using BridgePass<T>::BridgePass;
+
+  [[nodiscard]] Pass<T> *dup() const override { return new TransposePass(*this); }
+
+  void process(int, int plane, cudaStream_t stream) override {
+    auto sw = !!plane * this->vi.format->subSamplingW;
+    auto sh = !!plane * this->vi.format->subSamplingH;
+    auto width = this->vi.width >> sw;
+    auto height = this->vi.height >> sh;
+    dim3 blocks = dim3(64, 8);
+    dim3 grids = dim3((width - 1) / blocks.x + 1, (height - 1) / blocks.x + 1);
+    transpose<<<grids, blocks, 0, stream>>>(this->src, this->dst, width, height, this->d_pitch_src / sizeof(T) >> sw, this->d_pitch_dst / sizeof(T) >> sh);
+  }
+};
+
+template <typename T> struct ScaleDownWPass final : public BridgePass<T> {
+  using BridgePass<T>::BridgePass;
+
+  [[nodiscard]] Pass<T> *dup() const override { return new ScaleDownWPass(*this); }
+
+  void process(int, int plane, cudaStream_t stream) override {
+    auto sw = !!plane * this->vi.format->subSamplingW;
+    auto sh = !!plane * this->vi.format->subSamplingH;
+    auto width = this->vi2.width >> sw;
+    auto height = this->vi2.height >> sh;
+    dim3 blocks = dim3(64, 8);
+    dim3 grids = dim3((width - 1) / blocks.x + 1, (height - 1) / blocks.y + 1);
+    resample12<<<grids, blocks, 0, stream>>>(this->src, this->dst, width, height, this->d_pitch_src >> sw, this->d_pitch_dst >> sw);
+  }
+};
+
+template <typename T> struct ShiftWPass final : public BridgePass<T> {
+  using BridgePass<T>::BridgePass;
+
+  [[nodiscard]] Pass<T> *dup() const override { return new ShiftWPass(*this); }
+
+  void process(int, int plane, cudaStream_t stream) override {
+    auto sw = !!plane * this->vi.format->subSamplingW;
+    auto sh = !!plane * this->vi.format->subSamplingH;
+    auto width = this->vi.width >> sw;
+    auto height = this->vi.height >> sh;
+    dim3 blocks = dim3(64, 8);
+    dim3 grids = dim3((width - 1) / blocks.x + 1, (height - 1) / blocks.y + 1);
+    resample6<<<grids, blocks, 0, stream>>>(this->src, this->dst, width, height, this->d_pitch_src >> sw, this->d_pitch_dst >> sw);
+  }
+};
+
+template <typename T> class EEDI2Pass final : public Pass<T> {
+  EEDI2Param d;
+
+  T *dst, *msk, *src, *tmp;
+  T *dst2, *dst2M, *tmp2, *tmp2_2, *tmp2_3, *msk2;
+
+  unsigned map, pp, fieldS;
+  unsigned d_pitch;
+
+public:
+  EEDI2Pass(const EEDI2Pass &other) : Pass<T>(other), d(other.d), map(other.map), pp(other.pp), fieldS(other.fieldS) { initCuda(); }
+
+  EEDI2Pass(const VSVideoInfo &vi, const VSVideoInfo &vi2, EEDI2Param d, unsigned map, unsigned pp, unsigned fieldS)
+      : Pass<T>(vi, vi2), d(d), map(map), pp(pp), fieldS(fieldS) {
+    initCuda();
+  }
+
+  [[nodiscard]] Pass<T> *dup() const override { return new EEDI2Pass(*this); }
+
+  ~EEDI2Pass() override {
+    try_cuda(cudaFree(dst));
+    try_cuda(cudaFree(dst2));
+  }
+
+private:
+  void initCuda() {
+    constexpr size_t numMem = 4;
+    constexpr size_t numMem2x = 6;
+    T **mem = &dst;
+    size_t pitch;
+    auto width = this->vi.width;
+    auto height = this->vi.height;
+    auto height2x = height * 2;
+    try_cuda(cudaMallocPitch(&mem[0], &pitch, width * sizeof(T), height * numMem));
+    narrow_cast_to(d_pitch, pitch);
+    for (size_t i = 1; i < numMem; ++i)
+      mem[i] = reinterpret_cast<T *>(reinterpret_cast<char *>(mem[i - 1]) + d_pitch * height);
+
+    if (map == 0 || map == 3) {
+      try_cuda(cudaMalloc(&dst2, d_pitch * height * numMem2x * 2));
+      mem = &dst2;
+      for (size_t i = 1; i < numMem2x; ++i)
+        mem[i] = reinterpret_cast<T *>(reinterpret_cast<char *>(mem[i - 1]) + d_pitch * height2x);
+    } else {
+      dst2 = nullptr;
+    }
+  }
+
+public:
+  T *getSrcDevPtr() override { return src; }
+  unsigned getSrcPitch() override { return d_pitch; }
+  const T *getDstDevPtr() const override {
+    switch (map) {
+    case 0:
+      return dst2;
+    case 1:
+      return msk;
+    case 3:
+      return tmp2;
+    default:
+      return dst;
+    }
+  }
+  unsigned getDstPitch() override { return d_pitch; }
+
+  void process(int n, int plane, cudaStream_t stream) override {
+    auto field = fieldS;
+    if (field > 1)
+      field = (n & 1) ? (field == 2 ? 1 : 0) : (field == 2 ? 0 : 1);
+
+    auto subSampling = plane ? this->vi.format->subSamplingW : 0u;
+
+    auto width = this->vi.width >> subSampling;
+    auto height = this->vi.height >> subSampling;
+    auto height2x = height * 2;
+    auto width_bytes = width * sizeof(T);
+    auto d_pitch = this->d_pitch >> subSampling;
+
+    d.field = field;
+    d.width = width;
+    d.height = height;
+    d.subSampling = subSampling;
+    d.d_pitch = d_pitch;
+
+    dim3 blocks = dim3(64, 1);
+    dim3 grids = dim3((width - 1) / blocks.x + 1, (height - 1) / blocks.y + 1);
+
+    buildEdgeMask<<<grids, blocks, 0, stream>>>(d, src, msk);
+    erode<<<grids, blocks, 0, stream>>>(d, msk, tmp);
+    dilate<<<grids, blocks, 0, stream>>>(d, tmp, msk);
+    erode<<<grids, blocks, 0, stream>>>(d, msk, tmp);
+    removeSmallHorzGaps<<<grids, blocks, 0, stream>>>(d, tmp, msk);
+
+    if (map != 1) {
+      calcDirections<<<grids, blocks, 0, stream>>>(d, src, msk, tmp);
+      filterDirMap<<<grids, blocks, 0, stream>>>(d, msk, tmp, dst);
+      expandDirMap<<<grids, blocks, 0, stream>>>(d, msk, dst, tmp);
+      filterMap<<<grids, blocks, 0, stream>>>(d, msk, tmp, dst);
+
+      if (map != 2) {
+        auto upscaleBy2 = [&](const T *src, T *dst) {
+          try_cuda(cudaMemcpy2DAsync(dst + d_pitch * (1 - field), d_pitch * 2, src, d_pitch, width_bytes, height, cudaMemcpyDeviceToDevice,
+                                     stream));
+        };
+        try_cuda(cudaMemset2DAsync(dst2, d_pitch, 0, width_bytes, height2x, stream));
+        try_cuda(cudaMemset2DAsync(tmp2, d_pitch, 255, width_bytes, height2x, stream));
+        upscaleBy2(src, dst2);
+        upscaleBy2(dst, tmp2_2);
+        upscaleBy2(msk, msk2);
+
+        markDirections2X<<<grids, blocks, 0, stream>>>(d, msk2, tmp2_2, tmp2);
+        filterDirMap2X<<<grids, blocks, 0, stream>>>(d, msk2, tmp2, dst2M);
+        expandDirMap2X<<<grids, blocks, 0, stream>>>(d, msk2, dst2M, tmp2);
+        fillGaps2X<<<grids, blocks, 0, stream>>>(d, msk2, tmp2, tmp2_3);
+        fillGaps2XStep2<<<grids, blocks, 0, stream>>>(d, msk2, tmp2, tmp2_3, dst2M);
+        fillGaps2X<<<grids, blocks, 0, stream>>>(d, msk2, dst2M, tmp2_3);
+        fillGaps2XStep2<<<grids, blocks, 0, stream>>>(d, msk2, dst2M, tmp2_3, tmp2);
+
+        if (map != 3) {
+          if (field)
+            try_cuda(cudaMemcpyAsync(dst2 + d_pitch / sizeof(T) * (height2x - 1), dst2 + d_pitch / sizeof(T) * (height2x - 2), width_bytes,
+                                     cudaMemcpyDeviceToDevice, stream));
+          else
+            try_cuda(cudaMemcpyAsync(dst2, dst2 + d_pitch / sizeof(T), width_bytes, cudaMemcpyDeviceToDevice, stream));
+          try_cuda(cudaMemcpy2DAsync(tmp2_3, d_pitch, tmp2, d_pitch, width_bytes, height2x, cudaMemcpyDeviceToDevice, stream));
+
+          interpolateLattice<<<grids, blocks, 0, stream>>>(d, tmp2_2, tmp2, dst2, tmp2_3);
+
+          if (pp == 1) {
+            filterDirMap2X<<<grids, blocks, 0, stream>>>(d, msk2, tmp2_3, dst2M);
+            expandDirMap2X<<<grids, blocks, 0, stream>>>(d, msk2, dst2M, tmp2);
+            postProcess<<<grids, blocks, 0, stream>>>(d, tmp2, tmp2_3, dst2);
+          } else if (pp != 0) {
+            throw std::runtime_error("currently only pp == 1 is supported");
+          }
+        }
+      }
+    }
+  }
+};
+
+template <typename T> class Pipeline {
+  std::vector<std::unique_ptr<Pass<T>>> passes;
+  std::unique_ptr<VSNodeRef, void (*const)(VSNodeRef *)> node;
+  VSVideoInfo vi;
+  int device_id;
+  cudaStream_t stream;
+  T *h_src, *h_dst;
+  std::vector<T *> fbs;
+
+public:
+  Pipeline(std::string_view filterName, const VSMap *in, const VSAPI *vsapi)
+      : node(vsapi->propGetNode(in, "clip", 0, nullptr), vsapi->freeNode) {
+    using invalid_arg = std::invalid_argument;
+
+    vi = *vsapi->getVideoInfo(node.get());
+    auto vi2 = vi;
+    EEDI2Param d;
+    const auto &fmt = *vi.format;
+    unsigned map, pp, fieldS;
+
+    if (!isConstantFormat(&vi) || fmt.sampleType != stInteger || fmt.bytesPerSample > 2)
+      throw invalid_arg("only constant format 8-16 bits integer input supported");
+    if (vi.width < 8 || vi.height < 7)
+      throw invalid_arg("clip resolution too low");
+
+    auto propGetIntDefault = [&](const char *key, int64_t def) {
+      int err;
+      auto ret = vsapi->propGetInt(in, key, 0, &err);
+      return err ? def : ret;
+    };
+
+    if (filterName == "EEDI2")
+      numeric_cast_to(fieldS, vsapi->propGetInt(in, "field", 0, nullptr));
+    else
+      fieldS = 1;
+
+    numeric_cast_to(d.mthresh, propGetIntDefault("mthresh", 10));
+    numeric_cast_to(d.lthresh, propGetIntDefault("lthresh", 20));
+    numeric_cast_to(d.vthresh, propGetIntDefault("vthresh", 20));
+
+    numeric_cast_to(d.estr, propGetIntDefault("estr", 2));
+    numeric_cast_to(d.dstr, propGetIntDefault("dstr", 4));
+    numeric_cast_to(d.maxd, propGetIntDefault("maxd", 24));
+
+    numeric_cast_to(map, propGetIntDefault("map", 0));
+    numeric_cast_to(pp, propGetIntDefault("pp", 1));
+
+    unsigned nt;
+    numeric_cast_to(nt, propGetIntDefault("nt", 50));
+
+    numeric_cast_to(device_id, propGetIntDefault("device_id", -1));
+
+    if (fieldS > 3)
+      throw invalid_arg("field must be 0, 1, 2 or 3");
+    if (d.maxd < 1 || d.maxd > 29)
+      throw invalid_arg("maxd must be between 1 and 29 (inclusive)");
+    if (map > 3)
+      throw invalid_arg("map must be 0, 1, 2 or 3");
+    if (pp > 3)
+      throw invalid_arg("pp must be 0, 1, 2 or 3");
+
+    if (map == 0 || map == 3)
+      vi2.height *= 2;
+
+    d.mthresh *= d.mthresh;
+    d.vthresh *= 81;
+
+    nt <<= sizeof(T) * 8 - 8;
+    d.nt4 = nt * 4;
+    d.nt7 = nt * 7;
+    d.nt8 = nt * 8;
+    d.nt13 = nt * 13;
+    d.nt19 = nt * 19;
+
+    passes.emplace_back(new EEDI2Pass<T>(vi, vi2, d, map, pp, fieldS));
+
+    if (filterName != "EEDI2") {
+      auto vi3 = vi2;
+      std::swap(vi3.width, vi3.height); // XXX: this is correct for 420 & 444 only
+      passes.emplace_back(new TransposePass<T>(vi2, vi3));
+      auto vi4 = vi3;
+      if (filterName == "AA2") {
+        vi4.width /= 2;
+        passes.emplace_back(new ScaleDownWPass<T>(vi3, vi4));
+      } else {
+        passes.emplace_back(new ShiftWPass<T>(vi3, vi4));
+      }
+      auto vi5 = vi4;
+      vi5.height *= 2;
+      passes.emplace_back(new EEDI2Pass<T>(vi4, vi5, d, map, pp, fieldS));
+      auto vi6 = vi5;
+      std::swap(vi6.width, vi6.height);
+      passes.emplace_back(new TransposePass<T>(vi5, vi6));
+      auto vi7 = vi6;
+      if (filterName == "AA2") {
+        vi7.width /= 2;
+        passes.emplace_back(new ScaleDownWPass<T>(vi6, vi7));
+      } else {
+        passes.emplace_back(new ShiftWPass<T>(vi6, vi7));
+      }
+    }
+
+    passes.shrink_to_fit();
+
+    initCuda();
+  }
+
+  Pipeline(const Pipeline &other, const VSAPI *vsapi)
+      : node(vsapi->cloneNodeRef(other.node.get()), vsapi->freeNode), vi(other.vi), device_id(other.device_id) {
+    passes.reserve(other.passes.size());
+    for (const auto &step : other.passes)
+      passes.emplace_back(step->dup());
+
+    initCuda();
+  }
+
+  ~Pipeline() {
+    try_cuda(cudaFreeHost(h_src));
+    try_cuda(cudaFreeHost(h_dst));
+    for (auto fb : fbs)
+      try_cuda(cudaFree(fb));
+  }
+
+  const VSVideoInfo &getOutputVI() const { return passes.back()->getOutputVI(); }
+
+  VSFrameRef *getFrame(int n, int activationReason, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+    if (activationReason == arInitial) {
+      vsapi->requestFrameFilter(n, node.get(), frameCtx);
+      return nullptr;
+    } else if (activationReason != arAllFramesReady)
+      return nullptr;
+
+    if (device_id != -1)
+      try_cuda(cudaSetDevice(device_id));
+
+    auto vi2 = passes.back()->getOutputVI();
+
+    std::unique_ptr<const VSFrameRef, void (*const)(const VSFrameRef *)> src_frame{vsapi->getFrameFilter(n, node.get(), frameCtx),
+                                                                                   vsapi->freeFrame};
+    std::unique_ptr<VSFrameRef, void (*const)(const VSFrameRef *)> dst_frame{
+        vsapi->newVideoFrame(vi2.format, vi2.width, vi2.height, src_frame.get(), core), vsapi->freeFrame};
+
+    for (int plane = 0; plane < vi.format->numPlanes; ++plane) {
+      auto src_width = vsapi->getFrameWidth(src_frame.get(), plane);
+      auto src_height = vsapi->getFrameHeight(src_frame.get(), plane);
+      auto dst_width = vsapi->getFrameWidth(dst_frame.get(), plane);
+      auto dst_height = vsapi->getFrameHeight(dst_frame.get(), plane);
+      auto s_pitch_src = vsapi->getStride(src_frame.get(), plane);
+      auto s_pitch_dst = vsapi->getStride(dst_frame.get(), plane);
+      auto src_width_bytes = src_width * sizeof(T);
+      auto dst_width_bytes = dst_width * sizeof(T);
+      auto s_src = vsapi->getReadPtr(src_frame.get(), plane);
+      auto s_dst = vsapi->getWritePtr(dst_frame.get(), plane);
+      auto d_src = passes.front()->getSrcDevPtr();
+      auto d_dst = passes.back()->getDstDevPtr();
+      auto d_pitch_src = passes.front()->getSrcPitch() >> !!plane * vi.format->subSamplingW;
+      auto d_pitch_dst = passes.back()->getDstPitch() >> !!plane * vi2.format->subSamplingW;
+
+      // upload
+      vs_bitblt(h_src, d_pitch_src, s_src, s_pitch_src, src_width_bytes, src_height);
+      try_cuda(cudaMemcpy2DAsync(d_src, d_pitch_src, h_src, d_pitch_src, src_width_bytes, src_height, cudaMemcpyHostToDevice, stream));
+
+      // process
+      for (unsigned i = 0; i < passes.size(); ++i) {
+        auto &cur = *passes[i];
+        if (i) {
+          auto &last = *passes[i - 1];
+          auto &next = *passes[i + 1];
+          auto last_vi = last.getOutputVI();
+          auto sw = !!plane * last_vi.format->subSamplingW;
+          auto sh = !!plane * last_vi.format->subSamplingH;
+          if (!cur.getSrcDevPtr()) {
+            cur.setSrcDevPtr(const_cast<T *>(last.getDstDevPtr()));
+            cur.setSrcPitch(last.getDstPitch());
+          }
+          if (!cur.getDstDevPtr()) {
+            cur.setDstDevPtr(next.getSrcDevPtr());
+            cur.setDstPitch(next.getSrcPitch());
+          }
+          if (!cur.getDstDevPtr()) {
+            auto vi = cur.getOutputVI();
+            size_t pitch;
+            T *fb;
+            try_cuda(cudaMallocPitch(&fb, &pitch, vi.width * sizeof(T), vi.height));
+            cur.setDstDevPtr(fb);
+            next.setSrcDevPtr(fb);
+            cur.setDstPitch(static_cast<unsigned>(pitch));
+            next.setSrcPitch(static_cast<unsigned>(pitch));
+            fbs.push_back(fb);
+          }
+          auto curPtr = cur.getSrcDevPtr();
+          auto lastPtr = last.getDstDevPtr();
+          if (curPtr != lastPtr)
+            try_cuda(cudaMemcpy2DAsync(curPtr, cur.getSrcPitch() >> sw, lastPtr, last.getDstPitch() >> sw, last_vi.width * sizeof(T) >> sw,
+                                       last_vi.height >> sh, cudaMemcpyDeviceToDevice, stream));
+        }
+        cur.process(n, plane, stream);
+      }
+
+      // download
+      try_cuda(cudaMemcpy2DAsync(h_dst, d_pitch_dst, d_dst, d_pitch_dst, dst_width_bytes, dst_height, cudaMemcpyDeviceToHost, stream));
+      try_cuda(cudaStreamSynchronize(stream));
+      vs_bitblt(s_dst, s_pitch_dst, h_dst, d_pitch_dst, dst_width_bytes, dst_height);
+    }
+
+    return dst_frame.release();
+  }
+
+private:
+  void initCuda() {
+    try {
+      try_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    } catch (const CUDAError &exc) {
+      throw CUDAError(exc.what() + " Please upgrade your driver."s);
+    }
+
+    if (auto &firstStep = *passes.front(); !firstStep.getSrcDevPtr()) {
+      size_t pitch;
+      T *fb_d_src;
+      try_cuda(cudaMallocPitch(&fb_d_src, &pitch, vi.width * sizeof(T), vi.height));
+      firstStep.setSrcDevPtr(fb_d_src);
+      firstStep.setSrcPitch(static_cast<unsigned>(pitch));
+      fbs.push_back(fb_d_src);
+    }
+
+    if (auto &lastStep = *passes.back(); !lastStep.getDstDevPtr()) {
+      auto vi2 = lastStep.getOutputVI();
+      size_t pitch;
+      T *fb_d_dst;
+      try_cuda(cudaMallocPitch(&fb_d_dst, &pitch, vi2.width * sizeof(T), vi2.height));
+      lastStep.setDstDevPtr(fb_d_dst);
+      lastStep.setDstPitch(static_cast<unsigned>(pitch));
+      fbs.push_back(fb_d_dst);
+    }
+
+    auto d_pitch_src = passes.front()->getSrcPitch();
+    auto d_pitch_dst = passes.back()->getDstPitch();
+    auto src_height = vi.height;
+    auto dst_height = passes.back()->getOutputVI().height;
+    try_cuda(cudaHostAlloc(&h_src, d_pitch_src * src_height, cudaHostAllocWriteCombined));
+    try_cuda(cudaHostAlloc(&h_dst, d_pitch_dst * dst_height, cudaHostAllocDefault));
+  }
+};
+
+template <typename T> class Instance {
+  using Item = std::pair<Pipeline<T>, std::atomic_flag>;
+
+  unsigned num_streams;
+  boost::sync::semaphore semaphore;
+
+  Item *items() { return reinterpret_cast<Item *>(this + 1); }
+
+public:
+  Instance(std::string_view filterName, const VSMap *in, const VSAPI *vsapi) : semaphore(num_streams) {
+    auto items = this->items();
+    new (items) Item(std::piecewise_construct, std::forward_as_tuple(filterName, in, vsapi), std::forward_as_tuple());
+    items[0].second.clear();
+    for (unsigned i = 1; i < num_streams; ++i) {
+      new (items + i) Item(std::piecewise_construct, std::forward_as_tuple(firstReactor(), vsapi), std::forward_as_tuple());
+      items[i].second.clear();
+    }
+  }
+
+  ~Instance() {
+    auto items = this->items();
+    for (unsigned i = 0; i < num_streams; ++i)
+      items[i].~Item();
+  }
+
+  Pipeline<T> &firstReactor() { return items()[0].first; }
+
+  Pipeline<T> &acquireReactor() {
+    if (num_streams == 1)
+      return firstReactor();
+    semaphore.wait();
+    auto items = this->items();
+    for (unsigned i = 0; i < num_streams; ++i) {
+      if (!items[i].second.test_and_set())
+        return items[i].first;
+    }
+    unreachable();
+  }
+
+  void releaseReactor(const Pipeline<T> &instance) {
+    if (num_streams == 1)
+      return;
+    auto items = this->items();
+    for (unsigned i = 0; i < num_streams; ++i) {
+      if (&instance == &items[i].first) {
+        items[i].second.clear();
+        break;
+      }
+    }
+    semaphore.post();
+  }
+
+  static void *operator new(size_t sz, unsigned num_streams) {
+    auto p = static_cast<Instance *>(::operator new(sz + sizeof(Item) * num_streams));
+    p->num_streams = num_streams;
+    return p;
+  }
+
+  static void operator delete(void *p, unsigned) { ::operator delete(p); }
+
+  static void operator delete(void *p) { ::operator delete(p); }
+};
 
 template <typename T> void VS_CC eedi2Init(VSMap *, VSMap *, void **instanceData, VSNode *node, VSCore *, const VSAPI *vsapi) {
   auto data = static_cast<Instance<T> *>(*instanceData);
