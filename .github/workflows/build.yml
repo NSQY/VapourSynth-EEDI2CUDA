@@ -6,18 +6,27 @@ jobs:
   fetch-boost:
     runs-on: ubuntu-20.04
     steps:
+    - name: Cache Boost
+      id: cache-boost
+      uses: actions/cache@v2
+      with:
+        path: boost.zip
+        key: boost
     - name: Checkout Boost
       uses: actions/checkout@v2
       with:
         repository: boostorg/boost
         ref: dcea40897111fb7c4b92b17455e177d6d2bf735c
         submodules: recursive
+      if: steps.cache-boost.outputs.cache-hit != 'true'
     - name: Build Boost
       run: |
         ./bootstrap.sh
         ./b2 headers
+      if: steps.cache-boost.outputs.cache-hit != 'true'
     - name: Archive
-      run: zip -r0 boost.zip boost
+      run: zip -r9 boost.zip boost
+      if: steps.cache-boost.outputs.cache-hit != 'true'
     - name: Upload
       uses: actions/upload-artifact@v2
       with:
@@ -39,7 +48,7 @@ jobs:
       with:
         name: dep-boost
     - name: Expand Boost
-      run:  Expand-Archive Boost.zip -DestinationPath .
+      run:  Expand-Archive boost.zip -DestinationPath .
       shell: pwsh
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@v1
@@ -73,3 +82,33 @@ jobs:
       with:
         files: build/EEDI2CUDA-win64.zip
         draft: true
+  build-linux:
+    runs-on: ubuntu-20.04
+    needs: fetch-boost
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
+    - name: Download Boost
+      uses: actions/download-artifact@v2
+      with:
+        name: dep-boost
+    - name: Expand Boost
+      run:  unzip boost.zip
+    - name: Setup CUDA
+      uses: Jimver/cuda-toolkit@v0.2.4
+      with:
+        cuda: 11.2.2
+    - name: Configure
+      run: |
+        mkdir build
+        cmake -S. -Bbuild -DBoost_INCLUDE_DIRS=`pwd` -DCMAKE_BUILD_TYPE=Release
+    - name: Build
+      run: make
+      working-directory: build
+    - name: Upload
+      uses: actions/upload-artifact@v2
+      with:
+        name: EEDI2CUDA
+        path: build/libEEDI2CUDA.so
