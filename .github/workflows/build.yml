@@ -106,6 +106,9 @@ jobs:
     - name: Build
       run: make
       working-directory: build
+    - name: Strip
+      run: strip -s libEEDI2CUDA.so
+      working-directory: build
     - name: Upload
       uses: actions/upload-artifact@v2
       with:
