@@ -50,23 +50,21 @@ jobs:
     - name: Expand Boost
       run:  Expand-Archive boost.zip -DestinationPath .
       shell: pwsh
-    - name: Setup MSVC
-      uses: ilammy/msvc-dev-cmd@v1
-      with:
-        toolset: 14.25
-    - name: Install Ninja
-      run: choco install ninja
     - name: Setup CUDA
       uses: Jimver/cuda-toolkit@v0.2.4
       with:
         cuda: 11.2.2
         sub-packages: '["nvcc", "cudart"]'
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        toolset: 14.25
     - name: Configure
       run: |
         mkdir build
-        cmake -S. -Bbuild -GNinja -DBoost_INCLUDE_DIRS=%cd% -DCMAKE_BUILD_TYPE=Release
+        cmake -S. -Bbuild -G "NMake Makefiles" -DBoost_INCLUDE_DIRS=%cd% -DCMAKE_BUILD_TYPE=Release
     - name: Build
-      run: ninja
+      run: nmake
       working-directory: build
     - name: Archive
       run: Compress-Archive EEDI2CUDA.dll -DestinationPath EEDI2CUDA-win64.zip
