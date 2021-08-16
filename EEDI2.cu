@@ -1261,7 +1261,7 @@ public:
 
 template <typename T> class Pipeline {
   std::vector<std::unique_ptr<Pass<T>>> passes;
-  std::unique_ptr<VSNodeRef, void (*const)(VSNodeRef *)> node;
+  std::unique_ptr<VSNodeRef, void (VS_CC *const)(VSNodeRef *)> node;
   VSVideoInfo vi;
   int device_id;
   cudaStream_t stream;
@@ -1396,9 +1396,9 @@ public:
 
     auto vi2 = passes.back()->getOutputVI();
 
-    std::unique_ptr<const VSFrameRef, void (*const)(const VSFrameRef *)> src_frame{vsapi->getFrameFilter(n, node.get(), frameCtx),
+    std::unique_ptr<const VSFrameRef, void (VS_CC *const)(const VSFrameRef *)> src_frame{vsapi->getFrameFilter(n, node.get(), frameCtx),
                                                                                    vsapi->freeFrame};
-    std::unique_ptr<VSFrameRef, void (*const)(const VSFrameRef *)> dst_frame{
+    std::unique_ptr<VSFrameRef, void (VS_CC *const)(const VSFrameRef *)> dst_frame{
         vsapi->newVideoFrame(vi2.format, vi2.width, vi2.height, src_frame.get(), core), vsapi->freeFrame};
 
     for (int plane = 0; plane < vi.format->numPlanes; ++plane) {
@@ -1614,7 +1614,7 @@ template <typename T> void eedi2CreateInner(std::string_view filterName, const V
   }
 }
 
-void eedi2Create(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
+void VS_CC eedi2Create(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
   std::string_view filterName{static_cast<const char *>(userData)};
   VSNodeRef *node = vsapi->propGetNode(in, "clip", 0, nullptr);
   const VSVideoInfo *vi = vsapi->getVideoInfo(node);
