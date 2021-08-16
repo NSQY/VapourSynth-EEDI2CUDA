@@ -55,32 +55,42 @@ jobs:
       with:
         cuda: 11.2.2
         method: 'network'
-        sub-packages: '["nvcc", "cudart"]'
+        sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@v1
       with:
         toolset: 14.25
     - name: Configure
-      run: |
-        mkdir build
-        cmake -S. -Bbuild -G "NMake Makefiles" -DBoost_INCLUDE_DIRS=%cd% -DCMAKE_BUILD_TYPE=Release
+      run: cmake -S. -Bbuild -G "Visual Studio 16 2019" -A x64 -DBoost_INCLUDE_DIRS="%cd%" -DCMAKE_BUILD_TYPE=Release
     - name: Build
-      run: nmake
-      working-directory: build
-    - name: Archive
-      run: Compress-Archive EEDI2CUDA*.dll -DestinationPath EEDI2CUDA-win64.zip
-      working-directory: build
-      shell: pwsh
+      run: cmake --build build --config Release
     - name: Upload
       uses: actions/upload-artifact@v2
       with:
         name: EEDI2CUDA
-        path: build/EEDI2CUDA*.dll
+        path: build/Release/EEDI2CUDA*.dll
+    - name: Archive
+      run: Compress-Archive EEDI2CUDA*.dll -DestinationPath EEDI2CUDA-win64.zip
+      working-directory: build/Release
+      shell: pwsh
+    - name: Configure (x86)
+      run: cmake -S. -Bbuild-x86 -G "Visual Studio 16 2019" -A Win32 -DBoost_INCLUDE_DIRS="%cd%" -DCMAKE_BUILD_TYPE=Release
+    - name: Build (x86)
+      run: cmake --build build-x86 --config Release
+    - name: Upload (x86)
+      uses: actions/upload-artifact@v2
+      with:
+        name: EEDI2CUDA (x86)
+        path: build-x86/Release/EEDI2CUDA*.dll
+    - name: Archive (x86)
+      run: Compress-Archive EEDI2CUDA*.dll -DestinationPath EEDI2CUDA-win32.zip
+      working-directory: build-x86/Release
+      shell: pwsh
     - name: Release
       uses: softprops/action-gh-release@v1
       if: startsWith(github.ref, 'refs/tags/')
       with:
-        files: build/EEDI2CUDA-win64.zip
+        files: build/EEDI2CUDA*.zip
         draft: true
   build-linux:
     runs-on: ubuntu-20.04
@@ -103,12 +113,9 @@ jobs:
         method: 'network'
         sub-packages: '["nvcc", "cudart"]'
     - name: Configure
-      run: |
-        mkdir build
-        cmake -S. -Bbuild -DBoost_INCLUDE_DIRS=`pwd` -DCMAKE_BUILD_TYPE=Release
+      run: cmake -S. -Bbuild -DBoost_INCLUDE_DIRS="`pwd`" -DCMAKE_BUILD_TYPE=Release
     - name: Build
-      run: make
-      working-directory: build
+      run: cmake --build build --config Release
     - name: Strip
       run: strip -s libEEDI2CUDA*.so
       working-directory: build
